@@ -986,26 +986,46 @@ export function createHistoryPrefixPromptStore(value, changedIndex) {
  * @param {unknown} value Generated story text
  * @returns {string} A diagnostic reason, or an empty string for a plausible ending
  */
+// Whether the last quotation mark on a line opens a quotation. Curly marks
+// say so directly. A straight mark opens when it starts the line or follows
+// whitespace or an opening bracket and is followed by text; any other
+// straight mark closes ("Wait—" closes, as does a mark after a word).
+function lastQuotationMarkOpens(line) {
+    let opens = false;
+    for (let index = 0; index < line.length; index++) {
+        const character = line[index];
+        if (character === '“') opens = true;
+        else if (character === '”') opens = false;
+        else if (character === '"' && line[index - 1] !== '\\') {
+            const before = index === 0 ? ' ' : line[index - 1];
+            const after = line[index + 1];
+            opens = /[\s([{]/u.test(before) && after !== undefined && !/\s/u.test(after);
+        }
+    }
+    return opens;
+}
+
 export function incompleteProseReason(value) {
     const text = cleanString(value, 120_000).trim();
     if (!text) return 'empty output';
 
     const tail = text.slice(-320).trim();
-    // Balance delimiters over the whole reply. Counting only the tail can
-    // begin inside a valid quotation and misclassify its closing mark.
-    const count = character => [...text].filter(value => value === character).length;
-    const unmatchedPairs = [
-        ['“', '”', 'unclosed quotation'],
+    // A stream cut can only leave a delimiter open at the very end, so only
+    // the last line is checked, and only for an opener with no closer after
+    // it. Counting over the whole reply flagged complete prose - speech
+    // running over several paragraphs (each reopened, closed once at the
+    // end), mixed curly and straight marks, or one slip mid-reply - which
+    // Continue cannot fix.
+    const lastLine = text.split('\n').map(line => line.trim()).filter(Boolean).at(-1) || '';
+    const danglingPairs = [
         ['(', ')', 'unclosed parenthesis'],
         ['[', ']', 'unclosed bracket'],
         ['{', '}', 'unclosed brace'],
     ];
-    for (const [opening, closing, reason] of unmatchedPairs) {
-        if (count(opening) > count(closing)) return reason;
+    if (lastQuotationMarkOpens(lastLine)) return 'unclosed quotation';
+    for (const [opening, closing, reason] of danglingPairs) {
+        if (lastLine.lastIndexOf(opening) > lastLine.lastIndexOf(closing)) return reason;
     }
-
-    const straightQuotes = (text.match(/(?<!\\)"/gu) || []).length;
-    if (straightQuotes % 2 === 1) return 'unclosed quotation';
 
     if (/[,:;([{]\s*$/u.test(tail)) return 'unfinished punctuation';
     if (/\b(?:a|an|the|and|or|but|because|if|when|while|that|which|who|whose|is|are|was|were|be|been|being|to|of|for|from|with|without|at|in|on|by|into|onto|than|then|this|these|those|my|your|his|her|their|our|its)\s*$/iu.test(tail)) {

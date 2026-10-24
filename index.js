@@ -7129,6 +7129,19 @@ function queueCompletedAssistantTurn(store) {
     }
 }
 
+// Reasons that only say a reply may have been cut short. A reply still
+// showing one after the Continue attempts is kept for the user to judge, not
+// deleted; only empty output and leaked control text are quarantined.
+const SOFT_CUTOFF_REASONS = new Set([
+    'unclosed quotation',
+    'unclosed parenthesis',
+    'unclosed bracket',
+    'unclosed brace',
+    'unfinished punctuation',
+    'trailing connector',
+    'missing terminal punctuation',
+]);
+
 async function recoverIncompleteReply(messageIndex, initialReason) {
     // Provider state at the moment of failure - not minutes later when
     // recovery has finished - is what diagnoses the cause.
@@ -7201,6 +7214,7 @@ async function recoverIncompleteReply(messageIndex, initialReason) {
         const message = ctx.chat?.[messageIndex];
         const finalReason = generatedProseIssue(message?.mes);
         const completed = Boolean(message) && !finalReason;
+        const keptSoft = Boolean(message) && !completed && SOFT_CUTOFF_REASONS.has(finalReason);
         let quarantined = false;
         const store = getChatStore();
         if (store) {
@@ -7224,9 +7238,10 @@ async function recoverIncompleteReply(messageIndex, initialReason) {
                 attempts,
                 completed,
                 reason: finalReason || initialReason,
-                quarantined: !completed,
+                quarantined: !completed && !keptSoft,
+                kept: keptSoft,
             };
-            if (completed) {
+            if (completed || keptSoft) {
                 await ctx.saveChat?.();
             } else {
                 // Never leave unusable provider text visible in chat history.
@@ -7258,7 +7273,7 @@ async function recoverIncompleteReply(messageIndex, initialReason) {
         runtime.cutoffRecovery = false;
         // Never curate an empty, severed, or contaminated reply, and never
         // advance the world clock for a turn the user did not actually receive.
-        if (store && completed) {
+        if (store && (completed || keptSoft)) {
             if (store.needsRebuild) {
                 runtime.deferHistoryRebuild = false;
                 runtime.historyRebuildQueued = true;
@@ -7269,6 +7284,10 @@ async function recoverIncompleteReply(messageIndex, initialReason) {
         }
         if (completed) {
             setStatus('success', 'Reply recovered', `Recovered a clean, complete output in ${attempts} attempt${attempts === 1 ? '' : 's'}.`);
+        } else if (keptSoft) {
+            const detail = `Kept the reply, but it may still be cut short (${finalReason}). Edit it or press Continue if it is.`;
+            setStatus('error', 'Reply kept', detail);
+            toastr.warning(detail, DISPLAY_NAME, { timeOut: 8_000 });
         } else {
             const detail = errorText || (document.getElementById('send_textarea')?.value?.trim()
                 ? 'Automatic completion paused because text is waiting in the input box.'
