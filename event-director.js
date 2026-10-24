@@ -67,7 +67,14 @@ function normalizeDefinitionInput(value) {
             : Math.max(0, numberOr(revealSeconds, 0)),
         revealCondition: cleanString(source.revealCondition ?? source.reveal_condition, 1_500),
         resolutionCondition: cleanString(source.resolutionCondition ?? source.resolution_condition, 1_500),
-        consequences: cleanString(source.consequences, 4_000),
+        // Models often write consequences as a list ("consequences += ...",
+        // or a JSON array); join the items instead of rejecting the proposal.
+        consequences: cleanString(
+            Array.isArray(source.consequences)
+                ? source.consequences.filter(item => typeof item === 'string').join('\n')
+                : source.consequences,
+            4_000,
+        ),
         subjects: uniqueStrings(source.subjects || [], 30),
         priority: integer(source.priority, 55, 0, 65),
     };
