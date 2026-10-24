@@ -658,3 +658,23 @@ test('the DSL evaluation contract shows the matched-condition shape only when ke
     const without = appendDslEvaluationKeyContract([{ role: 'system', content: 'rules' }], 'dsl', []);
     assert.doesNotMatch(without[0].content, /trigger_action\.evidence/u);
 });
+
+test('DSL drops fields written with no value instead of failing the pass', () => {
+    const parsed = parseInnerLoreDsl([
+        'INNERLORE CURATOR 1',
+        'LOCATION Ben Tavern',
+        'importance = 70',
+        'summary =',
+        'facts +=',
+        'facts += The cellar floods in spring.',
+        'END',
+        'DONE',
+    ].join('\n'), 'curator');
+    assert.equal(parsed.entities[0].importance, 70);
+    assert.equal(parsed.entities[0].summary, undefined);
+    assert.deepEqual(parsed.entities[0].facts, ['The cellar floods in spring.']);
+    assert.deepEqual(
+        outputParseDiagnostics(parsed).filter(item => item.code === 'empty_assignment_dropped').map(item => item.path),
+        ['summary', 'facts'],
+    );
+});
