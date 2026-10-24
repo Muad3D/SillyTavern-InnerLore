@@ -18,6 +18,7 @@ import {
     hashString,
     messageRangeMatchesSnapshot,
     ensurePlayerEntity,
+    pruneCheckpointLadder,
     mergeEntityOperations,
     mergeMindOperations,
     messageFingerprint,
@@ -511,6 +512,10 @@ const defaultSettings = Object.freeze({
     minimumAdaptiveBatchTurns: 2,
     maintenanceSchedulingVersion: 1,
     lookbackMessages: 10,
+    // Resumable rebuild snapshots.
+    checkpointSpacingMessages: 10,
+    checkpointsKept: 6,
+    resumeProgressionFromCheckpoints: true,
     maximumEntitiesPerPass: 12,
     maximumMindOperationsPerPass: 20,
     minimumImportance: 35,
@@ -3532,6 +3537,9 @@ function applySettingsToUI() {
         il_card_detail: settings.cardDetail,
         il_auto_rebuild_history: settings.autoRebuildOnHistoryChange,
         il_auto_rebuild_limit: settings.autoRebuildMessageLimit,
+        il_checkpoint_spacing: settings.checkpointSpacingMessages,
+        il_checkpoints_kept: settings.checkpointsKept,
+        il_resume_progression: settings.resumeProgressionFromCheckpoints,
         il_maximum_thoughts: settings.maximumThoughtsPerBrain,
         il_maximum_thought_changes: settings.maximumThoughtChangesPerBrain,
         il_minimum_story_facet_observations: settings.minimumStoryFacetObservations,
@@ -4318,8 +4326,36 @@ function refreshEditors() {
     renderEventDirectorUI();
 }
 
+function checkpointLimit(settings = getSettings()) {
+    return Math.min(20, Math.max(2, Math.round(Number(settings?.checkpointsKept) || 6)));
+}
+
+let checkpointInfoCache = { list: null, interrupted: false, text: '' };
+function updateCheckpointInfo(store) {
+    const element = document.getElementById('il_checkpoint_info');
+    if (!element) return;
+    const list = Array.isArray(store?.checkpoints) ? store.checkpoints : [];
+    if (checkpointInfoCache.list !== list || checkpointInfoCache.interrupted !== Boolean(store?.interruptedRebuild)) {
+        let bytes = 0;
+        try {
+            bytes = new TextEncoder().encode(JSON.stringify(list)).length;
+        } catch { /* size is informational only */ }
+        const indexes = list.map(checkpoint => checkpoint?.index).filter(Number.isInteger).sort((a, b) => a - b);
+        const interrupted = store?.interruptedRebuild ? ' An interrupted rebuild can resume.' : '';
+        checkpointInfoCache = {
+            list,
+            interrupted: Boolean(store?.interruptedRebuild),
+            text: store
+                ? `${indexes.length} snapshot${indexes.length === 1 ? '' : 's'}${indexes.length ? ` (after messages ${indexes.join(', ')})` : ''}, ${(bytes / 1024).toFixed(0)} KB saved with this chat.${interrupted}`
+                : '',
+        };
+    }
+    element.textContent = checkpointInfoCache.text;
+}
+
 function updateUI() {
     const store = getChatStore();
+    updateCheckpointInfo(store);
     const stats = document.getElementById('il_stats');
     if (stats) {
         if (!store) {
@@ -5628,16 +5664,70 @@ function carryManualState(oldStore, newStore) {
 // long chat accumulates a bounded ladder rather than a checkpoint per turn.
 function maybeRecordCheckpoint(store, settings = getSettings()) {
     if (!store || !Number.isInteger(store.lastProcessedIndex) || store.lastProcessedIndex < 0) return;
-    const interval = Math.max(4, Number(settings?.lookbackMessages) || 10);
+    const interval = Math.min(50, Math.max(1, Math.round(Number(settings?.checkpointSpacingMessages) || 10)));
     const newest = (store.checkpoints || []).reduce(
         (max, checkpoint) => Math.max(max, Number.isInteger(checkpoint?.index) ? checkpoint.index : -1),
         -1,
     );
     if (store.lastProcessedIndex - newest < interval) return;
-    store.checkpoints = recordCheckpoint(store.checkpoints, createStoreCheckpoint(store));
+    store.checkpoints = recordCheckpoint(store.checkpoints, createStoreCheckpoint(store), checkpointLimit(settings));
 }
 
-async function rebuildFromChat({ automatic = false } = {}) {
+// World Progression as of a snapshot. Derived world state (clock,
+// goals, processes, events, log, watermark) comes from the snapshot; chat
+// configuration and transient request state start fresh exactly as a full
+// rebuild starts them. Returns null when the snapshot's progression covers a
+// message that no longer matches the chat (normal-play progression can run
+// ahead of the curator watermark the snapshot is validated by).
+function progressionFromCheckpoint(checkpoint, messages) {
+    if (!checkpoint?.progression || typeof checkpoint.progression !== 'object') return null;
+    const snapshot = normalizeProgressionState(clone(checkpoint.progression));
+    if (!messageRangeMatchesSnapshot(messages, snapshot.processedFingerprints || {})) return null;
+    const fresh = createProgressionState();
+    return {
+        ...fresh,
+        clock: snapshot.clock,
+        goals: snapshot.goals,
+        processes: snapshot.processes,
+        events: snapshot.events,
+        log: snapshot.log,
+        lastProcessedIndex: snapshot.lastProcessedIndex,
+        processedFingerprints: snapshot.processedFingerprints,
+        revision: snapshot.revision,
+        lastRunAt: snapshot.lastRunAt,
+        // Kept so trigger runtimes can be carried over below; replaced by the
+        // chat's current definitions before use.
+        eventDefinitions: snapshot.eventDefinitions,
+        eventRuntime: snapshot.eventRuntime,
+    };
+}
+
+function stableJson(value) {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value) ?? 'null';
+}
+
+// The snapshot a rebuild would resume from right now, or null.
+function plannedRebuildResume(store, messages, { automatic = false, fresh = false } = {}) {
+    if (!store || fresh) return null;
+    const interrupted = Boolean(store.interruptedRebuild);
+    if (!automatic && !interrupted) return null;
+    // An interrupted rebuild's snapshots belong to the replacement state, not
+    // to the old complete store, so the old store's fingerprints say nothing
+    // about them; every snapshot is still checked against the chat itself.
+    // With no divergence at all (every processed message still matches),
+    // resume from the newest snapshot rather than replaying the chat.
+    const endOfChat = lastCompletedStoryIndex(messages) + 1;
+    const divergenceIndex = interrupted
+        ? endOfChat
+        : Math.min(endOfChat, firstDivergenceIndex(messages, store.processedFingerprints || {}));
+    return selectResumeCheckpoint(store.checkpoints, messages, divergenceIndex);
+}
+
+async function rebuildFromChat({ automatic = false, fresh = false } = {}) {
     const settings = getSettings();
     if (runtime.processing || runtime.rebuilding || runtime.preparingFoundation) {
         if (automatic) runtime.historyRebuildQueued = true;
@@ -5654,7 +5744,13 @@ async function rebuildFromChat({ automatic = false } = {}) {
         oldStore.consecutiveFailures = 0;
         oldStore.nextRetryAt = 0;
     }
-    if (automatic && ctx.chat.length > settings.autoRebuildMessageLimit) {
+    const plannedResume = plannedRebuildResume(oldStore, ctx.chat, { automatic, fresh });
+    const messagesToReplay = plannedResume
+        ? ctx.chat.length - 1 - plannedResume.index
+        : ctx.chat.length;
+    // The automatic limit counts messages to re-read, so a long
+    // chat with a nearby snapshot still rebuilds itself after a swipe.
+    if (automatic && messagesToReplay > settings.autoRebuildMessageLimit) {
         oldStore.needsRebuild = true;
         await saveChatStore();
         setStatus('error', 'Rebuild needed', `History changed, but this chat has ${ctx.chat.length} messages (automatic limit: ${settings.autoRebuildMessageLimit}). Use Rebuild From Chat when convenient.`);
@@ -5673,10 +5769,7 @@ async function rebuildFromChat({ automatic = false } = {}) {
     // empty store. Manual "Rebuild From Chat" always starts fresh. Only the
     // expensive per-batch curator fold is resumed; World Progression is rebuilt
     // fully in both paths (its runtime is not resumed mid-history yet).
-    const divergenceIndex = firstDivergenceIndex(ctx.chat, oldStore.processedFingerprints || {});
-    const resumeCheckpoint = automatic && Number.isFinite(divergenceIndex)
-        ? selectResumeCheckpoint(oldStore.checkpoints, ctx.chat, divergenceIndex)
-        : null;
+    const resumeCheckpoint = plannedResume;
     const temporary = createEmptyStore(runChatId);
     let rebuildStartIndex = 0;
     // A full replay starts from the same card-declared canon a new chat gets.
@@ -5687,10 +5780,15 @@ async function rebuildFromChat({ automatic = false } = {}) {
         temporary.checkpoints = (oldStore.checkpoints || [])
             .filter(checkpoint => Number.isInteger(checkpoint?.index) && checkpoint.index <= resumeCheckpoint.index);
         rebuildStartIndex = resumeCheckpoint.index + 1;
-        setStatus('working', 'Rebuilding', `Resuming from message ${resumeCheckpoint.index}; re-deriving ${completedHistoryIndex - resumeCheckpoint.index} of ${ctx.chat.length} messages…`);
+        setStatus('working', 'Rebuilding', `Resuming after message ${resumeCheckpoint.index}; re-deriving ${Math.max(0, completedHistoryIndex - resumeCheckpoint.index)} of ${ctx.chat.length} messages…`);
     }
     temporary.expressionFoundationVersion = 0;
-    temporary.progression = createProgressionState();
+    const resumedProgression = resumeCheckpoint && settings.resumeProgressionFromCheckpoints !== false
+        ? progressionFromCheckpoint(resumeCheckpoint, ctx.chat)
+        : null;
+    const snapshotEventDefinitions = resumedProgression?.eventDefinitions || {};
+    const snapshotEventRuntime = resumedProgression?.eventRuntime || {};
+    temporary.progression = resumedProgression || createProgressionState();
     temporary.progression.eventDefinitions = Object.fromEntries(Object.entries(
         clone(normalizeProgressionState(oldStore.progression).eventDefinitions),
     ).filter(([, definition]) => definition.origin !== 'automatic_director'));
@@ -5704,6 +5802,20 @@ async function rebuildFromChat({ automatic = false } = {}) {
         }
     }
     temporary.progression = resetTriggerEventRuntime(temporary.progression, { replayCreationAnchors: true });
+    if (resumedProgression) {
+        // A trigger event defined identically when the snapshot was taken
+        // keeps the runtime it had there (armed, fired, delivered). A new,
+        // edited, or moved definition is re-armed from its creation message
+        // like a full rebuild; deleted and Event Director definitions are
+        // already gone from the current set.
+        for (const definition of Object.values(temporary.progression.eventDefinitions)) {
+            const before = snapshotEventDefinitions[definition.id];
+            const runtime = snapshotEventRuntime[definition.id];
+            if (before && runtime && stableJson(before) === stableJson(definition)) {
+                temporary.progression.eventRuntime[definition.id] = clone(runtime);
+            }
+        }
+    }
     temporary.lorebookName = oldStore.lorebookName;
     // The game journal rewinds exactly: everything recorded before the first
     // changed message stays, and the ledger re-reads only what follows. A
@@ -5722,7 +5834,8 @@ async function rebuildFromChat({ automatic = false } = {}) {
     runtime.rebuilding = true;
     runtime.historyRebuildQueued = false;
     runtime.controller = new AbortController();
-    setStatus('working', 'Rebuilding', `Rebuilding ${ctx.chat.length} messages…`);
+    if (!resumeCheckpoint) setStatus('working', 'Rebuilding', `Rebuilding ${ctx.chat.length} messages…`);
+    const resumeNote = resumeCheckpoint ? ` (resumed after message ${resumeCheckpoint.index})` : '';
     try {
         let start = rebuildStartIndex;
         while (start <= completedHistoryIndex) {
@@ -5737,7 +5850,7 @@ async function rebuildFromChat({ automatic = false } = {}) {
                 .filter(index => index >= start && index <= end)
                 .sort((a, b) => a - b)[0];
             if (Number.isInteger(creationBoundary)) end = creationBoundary;
-            setStatus('working', 'Rebuilding', `Rebuilding messages ${start}–${end} of ${ctx.chat.length - 1}…`);
+            setStatus('working', 'Rebuilding', `Rebuilding messages ${start}–${end} of ${ctx.chat.length - 1}${resumeNote}…`);
             const result = await analyzeRange(temporary, start, end, {
                 persist: false,
                 sync: false,
@@ -5753,7 +5866,7 @@ async function rebuildFromChat({ automatic = false } = {}) {
             // Capture a checkpoint of the curator fold after each completed
             // batch so a later edit/swipe can resume from here instead of
             // replaying the whole chat.
-            temporary.checkpoints = recordCheckpoint(temporary.checkpoints, createStoreCheckpoint(temporary));
+            temporary.checkpoints = recordCheckpoint(temporary.checkpoints, createStoreCheckpoint(temporary), checkpointLimit(settings));
         }
 
         const expectedProgressionIndex = completedHistoryIndex;
@@ -5788,7 +5901,7 @@ async function rebuildFromChat({ automatic = false } = {}) {
         temporary.needsRebuild = false;
         // Record a final checkpoint at the completed head so the next edit can
         // resume from the very end of this rebuild.
-        temporary.checkpoints = recordCheckpoint(temporary.checkpoints, createStoreCheckpoint(temporary));
+        temporary.checkpoints = recordCheckpoint(temporary.checkpoints, createStoreCheckpoint(temporary), checkpointLimit(settings));
         runtime.store = temporary;
         runtime.storeChatId = runChatId;
         const pointer = ctx.chatMetadata?.[MODULE_KEY];
@@ -5813,8 +5926,16 @@ async function rebuildFromChat({ automatic = false } = {}) {
         setStatus('success', 'Rebuilt', detail);
         if (!automatic) toastr.success(detail, DISPLAY_NAME, { timeOut: 4_000 });
     } catch (error) {
+        // Batches that completed before the failure are kept as
+        // snapshots, so the next rebuild resumes after them instead of
+        // replaying the whole chat. The live store is untouched either way.
+        const progressKept = error?.name !== 'InnerLoreHistoryChangedError'
+            && preserveRebuildProgress(oldStore, temporary, resumeCheckpoint, runChatId, settings);
         if (error?.name === 'AbortError' || runtime.controller?.signal.aborted) {
-            setStatus('idle', 'Stopped', 'Rebuild stopped; the previous complete state is still intact.');
+            setStatus('idle', 'Stopped', progressKept
+                ? `Rebuild stopped; the previous complete state is still intact. Rebuild From Chat resumes after message ${oldStore.interruptedRebuild.resumeIndex}.`
+                : 'Rebuild stopped; the previous complete state is still intact.');
+            if (progressKept) await saveChatStore();
         } else if (error?.name === 'InnerLoreHistoryChangedError') {
             oldStore.needsRebuild = true;
             runtime.historyRebuildQueued = true;
@@ -5829,7 +5950,11 @@ async function rebuildFromChat({ automatic = false } = {}) {
             // A resumed rebuild that failed for a non-transient reason may be
             // sitting on an unusable checkpoint. Drop the ladder so the retry
             // degrades to a clean full rebuild instead of looping on it.
-            if (resumeCheckpoint && !isTransientRequestError(error)) oldStore.checkpoints = [];
+            // (Not when this run saved new progress, and not for
+            // an interrupted rebuild the user is continuing on purpose.)
+            if (resumeCheckpoint && !isTransientRequestError(error) && !progressKept && !oldStore.interruptedRebuild) {
+                oldStore.checkpoints = [];
+            }
             const retryDelays = [5_000, 15_000, 45_000];
             const retryDelay = isTransientRequestError(error)
                 ? retryDelays[oldStore.consecutiveFailures - 1] || 0
@@ -5840,11 +5965,15 @@ async function rebuildFromChat({ automatic = false } = {}) {
                 setStatus(
                     'working',
                     'Rebuild retry scheduled',
-                    `${oldStore.lastError} Restarting the clean rebuild in ${Math.round(retryDelay / 1_000)} seconds.`,
+                    progressKept
+                        ? `${oldStore.lastError} Resuming after message ${oldStore.interruptedRebuild.resumeIndex} in ${Math.round(retryDelay / 1_000)} seconds.`
+                        : `${oldStore.lastError} Restarting the clean rebuild in ${Math.round(retryDelay / 1_000)} seconds.`,
                 );
             } else {
                 oldStore.nextRetryAt = 0;
-                setStatus('error', 'Rebuild failed', oldStore.lastError);
+                setStatus('error', 'Rebuild failed', progressKept
+                    ? `${oldStore.lastError} Rebuild From Chat resumes after message ${oldStore.interruptedRebuild.resumeIndex}.`
+                    : oldStore.lastError);
                 if (!automatic) toastr.error(oldStore.lastError, DISPLAY_NAME, { timeOut: 8_000 });
             }
             await saveChatStore();
@@ -5859,6 +5988,32 @@ async function rebuildFromChat({ automatic = false } = {}) {
             scheduleQueuedHistoryRebuild(250);
         }
     }
+}
+
+function preserveRebuildProgress(oldStore, temporary, resumeCheckpoint, runChatId, settings = getSettings()) {
+    if (!oldStore || !temporary || currentChatId() !== runChatId) return false;
+    const startedAfter = Number.isInteger(resumeCheckpoint?.index) ? resumeCheckpoint.index : -1;
+    const made = (temporary.checkpoints || [])
+        .filter(checkpoint => Number.isInteger(checkpoint?.index) && checkpoint.index > startedAfter);
+    if (!made.length) return false;
+    // Merge the run's snapshots into the old ladder's snapshots that still
+    // match the chat. Old ones past a change (or from a longer chat) are
+    // dropped so they cannot crowd valid ones out of the bounded ladder; old
+    // valid ones are kept, so a run that started further back than it needed
+    // to does not throw away a later resume point.
+    const messages = context().chat || [];
+    let ladder = (Array.isArray(oldStore.checkpoints) ? oldStore.checkpoints : [])
+        .filter(checkpoint => Number.isInteger(checkpoint?.index)
+            && messageRangeMatchesSnapshot(messages, checkpoint.processedFingerprints || {}));
+    for (const checkpoint of (temporary.checkpoints || [])) {
+        ladder = recordCheckpoint(ladder, clone(checkpoint), checkpointLimit(settings));
+    }
+    oldStore.checkpoints = pruneCheckpointLadder(ladder, checkpointLimit(settings));
+    oldStore.interruptedRebuild = {
+        at: Date.now(),
+        resumeIndex: Math.max(...oldStore.checkpoints.map(checkpoint => checkpoint.index)),
+    };
+    return true;
 }
 
 function scheduleQueuedHistoryRebuild(delay = 2_500) {
@@ -6713,6 +6868,9 @@ function bindUIEvents() {
     bindNumber('il_max_minds_per_pass', 'maximumMindOperationsPerPass', 1, 50);
     bindNumber('il_minimum_importance', 'minimumImportance', 0, 100);
     bindNumber('il_auto_rebuild_limit', 'autoRebuildMessageLimit', 10, 1_000);
+    bindNumber('il_checkpoint_spacing', 'checkpointSpacingMessages', 1, 50);
+    bindNumber('il_checkpoints_kept', 'checkpointsKept', 2, 20, () => updateUI());
+    bindCheckbox('il_resume_progression', 'resumeProgressionFromCheckpoints');
     bindNumber('il_maximum_thoughts', 'maximumThoughtsPerBrain', 4, 200);
     bindNumber('il_maximum_thought_changes', 'maximumThoughtChangesPerBrain', 1, 50);
     bindNumber('il_minimum_story_facet_observations', 'minimumStoryFacetObservations', 1, 5);
@@ -6869,9 +7027,17 @@ function bindUIEvents() {
     });
 
     document.getElementById('il_scan_now')?.addEventListener('click', () => processPending({ force: true }));
-    document.getElementById('il_rebuild')?.addEventListener('click', () => {
-        if (confirm('Rebuild InnerLore from the current chat? Existing automatic state will be replaced, while protected manual lore and pinned records are retained.')) {
-            rebuildFromChat();
+    document.getElementById('il_rebuild')?.addEventListener('click', event => {
+        // An interrupted rebuild resumes; Shift-click starts over.
+        const resume = event?.shiftKey ? null : plannedRebuildResume(getChatStore(), context().chat || []);
+        if (resume) {
+            if (confirm(`Resume the interrupted InnerLore rebuild after message ${resume.index}? (Shift-click Rebuild From Chat to start over from message 0 instead.)`)) {
+                rebuildFromChat();
+            }
+            return;
+        }
+        if (confirm('Rebuild InnerLore from the current chat from message 0? Existing automatic state will be replaced, while protected manual lore and pinned records are retained.')) {
+            rebuildFromChat({ fresh: true });
         }
     });
     document.getElementById('il_stop')?.addEventListener('click', stopCurrentPass);
@@ -7073,6 +7239,51 @@ function bindUIEvents() {
     document.getElementById('il_event_proposal_delete')?.addEventListener('click', deleteSelectedEventProposal);
 }
 
+// Why a rebuild cannot resume. Finds the first message whose
+// current fingerprint differs from a saved one, and whether its text or its
+// role (hidden/system vs. user/assistant) changed.
+function fingerprintMismatch(messages, fingerprints) {
+    const indexes = Object.keys(fingerprints || {}).map(Number).filter(Number.isInteger).sort((a, b) => a - b);
+    for (const index of indexes) {
+        const saved = fingerprints[index];
+        const message = messages[index];
+        if (!message) return { index, cause: 'message no longer exists (the chat is shorter now)' };
+        const current = messageFingerprint(message);
+        if (current === saved) continue;
+        const text = cleanString(message.mes, 100_000);
+        const roleOf = fingerprint => ['system', 'user', 'assistant'].find(role => hashString(`${role}\n${text}`) === fingerprint);
+        const savedRole = roleOf(saved);
+        const cause = savedRole
+            ? `role changed: saved as ${savedRole}, now ${roleOf(current) || 'other'} (hidden/unhidden?)`
+            : 'text changed';
+        return { index, cause, preview: text.replace(/\s+/gu, ' ').slice(0, 90) };
+    }
+    return null;
+}
+
+function snapshotReport() {
+    const store = getChatStore();
+    const chat = context().chat || [];
+    if (!store) return ['InnerLore: no active chat.'];
+    const describe = mismatch => mismatch
+        ? `message ${mismatch.index}: ${mismatch.cause}${mismatch.preview !== undefined ? ` — "${mismatch.preview}"` : ''}`
+        : 'matches the chat';
+    const lines = [`Chat: ${chat.length} messages. Processed through message ${store.lastProcessedIndex}.`];
+    lines.push(`Processed state: ${describe(fingerprintMismatch(chat, store.processedFingerprints))}.`);
+    const checkpoints = [...(store.checkpoints || [])].sort((a, b) => a.index - b.index);
+    if (!checkpoints.length) lines.push('No snapshots.');
+    for (const checkpoint of checkpoints) {
+        const mismatch = fingerprintMismatch(chat, checkpoint.processedFingerprints);
+        lines.push(`Snapshot after message ${checkpoint.index}: ${mismatch ? `unusable — ${describe(mismatch)}` : 'usable'}.`);
+    }
+    const resume = plannedRebuildResume(store, chat, { automatic: true });
+    lines.push(resume
+        ? `A rebuild now would resume after message ${resume.index}.`
+        : 'A rebuild now would start from message 0.');
+    if (store.interruptedRebuild) lines.push(`Interrupted rebuild recorded (resume point ${store.interruptedRebuild.resumeIndex}).`);
+    return lines;
+}
+
 function registerSlashCommands() {
     const ctx = context();
     if (!ctx.SlashCommandParser?.addCommandObject || !ctx.SlashCommand?.fromProps) return;
@@ -7101,6 +7312,21 @@ function registerSlashCommands() {
             return `InnerLore: ${Object.keys(store.entities).length} lore entries, ${Object.keys(store.brains).length} minds, processed through message ${store.lastProcessedIndex}; story clock ${progression.clock}, ${progression.activeGoals} active goals, ${progression.activeProcesses} active processes, ${progression.due} due/possible beats, ${progression.triggerEvents.enabled} enabled editor events (${progression.activeTriggerEvents} active, ${progression.observableTriggerEvents} observable)${store.needsRebuild ? '; rebuild required and stale injection quarantined' : ''}.`;
         },
         helpString: 'Show InnerLore state counts for the current chat.',
+    }));
+    ctx.SlashCommandParser.addCommandObject(ctx.SlashCommand.fromProps({
+        name: 'innerlore-snapshots',
+        callback: () => {
+            const lines = snapshotReport();
+            console.info(`${LOG_PREFIX} Snapshot report:\n${lines.join('\n')}`);
+            toastr.info(lines.map(line => escapeHtml(line)).join('<br>'), `${DISPLAY_NAME} snapshots`, {
+                timeOut: 0,
+                extendedTimeOut: 0,
+                closeButton: true,
+                escapeHtml: false,
+            });
+            return lines.join('\n');
+        },
+        helpString: 'Show which rebuild snapshots still match the chat, and the first changed message for each that does not.',
     }));
     ctx.SlashCommandParser.addCommandObject(ctx.SlashCommand.fromProps({
         name: 'innerlore-time',

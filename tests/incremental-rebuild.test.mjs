@@ -172,3 +172,32 @@ test('an early edit with no covering checkpoint falls back to a full rebuild', a
     assert.equal(rebuilt.entities['location:old landmark'], undefined, 'no checkpoint covered the early edit, so a full rebuild dropped stale state');
     assert.ok(counter.count >= 2, `a full 0..22 rebuild should issue multiple curator batches, issued ${counter.count}`);
 });
+
+test('a rebuild with no changed message resumes from the newest checkpoint instead of replaying the chat', async () => {
+    const chat = buildChat();
+
+    const cpStore = createEmptyStore('no-divergence-chat');
+    cpStore.lastProcessedIndex = 22;
+    cpStore.processedFingerprints = snapshotMessageRange(chat, 0, 22);
+    mergeEntityOperations(cpStore, [{ type: 'location', name: 'Old Landmark', importance: 80, facts: ['Established early.'] }], { messageIndex: 5, minimumImportance: 0 });
+    const checkpoint = createStoreCheckpoint(cpStore);
+
+    const store = createEmptyStore('no-divergence-chat');
+    store.lastProcessedIndex = 22;
+    store.processedFingerprints = snapshotMessageRange(chat, 0, 22);
+    store.checkpoints = [checkpoint];
+    store.entities = structuredClone(checkpoint.entities);
+    // A rebuild was requested (for example by a swipe seen before its new
+    // text existed), but every processed message still matches.
+    store.needsRebuild = true;
+
+    const counter = { count: 0 };
+    harness(chat, store, counter);
+    await import(`../index.js?no-divergence=${Date.now()}`);
+    await waitFor(() => SillyTavern.getContext().chatMetadata.inner_lore.needsRebuild === false, 8_000);
+
+    const rebuilt = SillyTavern.getContext().chatMetadata.inner_lore;
+    assert.ok(rebuilt.entities['location:old landmark'], 'resumed from the checkpoint');
+    assert.equal(rebuilt.lastProcessedIndex, 22);
+    assert.equal(counter.count, 0, `nothing needed re-reading, issued ${counter.count} requests`);
+});

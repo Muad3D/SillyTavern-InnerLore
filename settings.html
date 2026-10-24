@@ -436,6 +436,23 @@
                         <span>Maximum messages for automatic rebuild</span>
                         <input id="il_auto_rebuild_limit" class="text_pole" type="number" min="10" max="1000" step="10" />
                     </label>
+                    <small class="inner-lore-hint">Counts messages that need re-reading: a swipe or edit that can resume from a nearby snapshot stays under the limit even in a long chat.</small>
+                    <div class="inner-lore-grid two-columns">
+                        <label title="A snapshot of the lore, minds, and world progression is saved after this many processed messages. 1 = after every pass, so a swipe on the latest reply re-reads only that reply.">
+                            <span>Snapshot spacing (messages)</span>
+                            <input id="il_checkpoint_spacing" class="text_pole" type="number" min="1" max="50" step="1" />
+                        </label>
+                        <label title="How many snapshots this chat keeps. Older ones are thinned out first. Each one is a full copy of the state, saved with the chat on every save.">
+                            <span>Snapshots kept</span>
+                            <input id="il_checkpoints_kept" class="text_pole" type="number" min="2" max="20" step="1" />
+                        </label>
+                    </div>
+                    <label class="checkbox_label" for="il_resume_progression" title="Off: World Progression is re-read from message 0 on every rebuild, as in stock InnerLore.">
+                        <input id="il_resume_progression" type="checkbox" />
+                        <span>Resume World Progression from snapshots</span>
+                    </label>
+                    <small id="il_checkpoint_info" class="inner-lore-hint"></small>
+                    <small class="inner-lore-hint">A failed or stopped rebuild keeps its finished batches; Rebuild From Chat then resumes after them. Shift-click Rebuild From Chat to start over from message 0.</small>
                 </div>
             </div>
 
