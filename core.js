@@ -832,6 +832,9 @@ export function createEmptyStore(chatId = '') {
         lastProcessedIndex: -1,
         processedFingerprints: {},
         checkpoints: [],
+        // Set when a failed or stopped rebuild kept its finished batches as
+        // snapshots: { at, resumeIndex }. Replaced stores start null.
+        interruptedRebuild: null,
         assistantTurnsSincePass: 0,
         createdAt: Date.now(),
         updatedAt: Date.now(),
