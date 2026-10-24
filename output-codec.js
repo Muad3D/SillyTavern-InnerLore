@@ -517,6 +517,15 @@ export function parseInnerLoreDsl(value, requestedTask) {
                 line = `${lastAppend.path} += ${abbreviatedAppend[1]}`;
                 diagnostics.push({ code: 'implicit_list_path', lineNumber, path: lastAppend.path });
             }
+            // A field written with no value ("field =" or "field +=") carries no
+            // information. Models that copy every field of the template write
+            // them for fields they leave empty; drop the line instead of
+            // failing the whole pass and paying for a repair call.
+            const emptyAssignment = /^([a-z][a-z0-9_.\[\]]*)\s*(\+=|=)\s*$/u.exec(line);
+            if (emptyAssignment) {
+                diagnostics.push({ code: 'empty_assignment_dropped', lineNumber, path: emptyAssignment[1] });
+                continue;
+            }
             let assignment = /^([a-z][a-z0-9_.\[\]]*)\s*(\+=|=)\s*(.+)$/u.exec(line);
             if (!assignment) {
                 // Some models (NovelAI's Xialong) write nested item fields as
