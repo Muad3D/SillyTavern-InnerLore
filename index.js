@@ -5672,8 +5672,16 @@ async function rebuildFromChat({ automatic = false } = {}) {
     // empty store. Manual "Rebuild From Chat" always starts fresh. Only the
     // expensive per-batch curator fold is resumed; World Progression is rebuilt
     // fully in both paths (its runtime is not resumed mid-history yet).
-    const divergenceIndex = firstDivergenceIndex(ctx.chat, oldStore.processedFingerprints || {});
-    const resumeCheckpoint = automatic && Number.isFinite(divergenceIndex)
+    // firstDivergenceIndex() returns Infinity when every processed message
+    // still matches - a rebuild requested before a swipe's new text exists,
+    // or a flag left set across a reload. That used to skip the checkpoint
+    // lookup and replay the whole chat; it now resumes from the newest
+    // checkpoint, each of which is still verified against the chat itself.
+    const divergenceIndex = Math.min(
+        completedHistoryIndex + 1,
+        firstDivergenceIndex(ctx.chat, oldStore.processedFingerprints || {}),
+    );
+    const resumeCheckpoint = automatic
         ? selectResumeCheckpoint(oldStore.checkpoints, ctx.chat, divergenceIndex)
         : null;
     const temporary = createEmptyStore(runChatId);
