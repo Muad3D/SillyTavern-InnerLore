@@ -677,4 +677,27 @@ test('DSL drops fields written with no value instead of failing the pass', () =>
         outputParseDiagnostics(parsed).filter(item => item.code === 'empty_assignment_dropped').map(item => item.path),
         ['summary', 'facts'],
     );
+
+test('progression DSL accepts plural record words copied from the JSON field names', () => {
+    const parsed = parseInnerLoreDsl([
+        'INNERLORE PROGRESSION 1',
+        'TIME',
+        'elapsed.estimated_seconds = 60',
+        'confidence = 1',
+        'END',
+        'GOALS courier_delivery',
+        'owner = Mara',
+        'title = Deliver the letter',
+        'status = active',
+        'END',
+        'PROCESSES mill_repair',
+        'subject_type = location',
+        'subject_name = Old Mill',
+        'title = Mill repair',
+        'status = active',
+        'END',
+        'DONE',
+    ].join('\n'), 'progression');
+    assert.deepEqual(parsed.goals.map(goal => goal.key), ['courier_delivery']);
+    assert.deepEqual(parsed.processes.map(process => process.key), ['mill_repair']);
 });
