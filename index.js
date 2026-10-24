@@ -6743,7 +6743,7 @@ function bindUIEvents() {
     bindNumber('il_progression_every', 'progressionEveryAssistantTurns', 1, 20);
     bindNumber('il_progression_maximum_response_tokens', 'progressionMaximumResponseTokens', 800, 32_000);
     bindNumber('il_progression_temperature', 'progressionTemperature', 0, 1.5);
-    bindNumber('il_progression_request_timeout', 'progressionRequestTimeoutSeconds', 15, 90);
+    bindNumber('il_progression_request_timeout', 'progressionRequestTimeoutSeconds', 15, 300);
     bindNumber('il_progression_maximum_goals', 'progressionMaximumGoals', 1, 200);
     bindNumber('il_progression_maximum_processes', 'progressionMaximumProcesses', 1, 200);
     bindNumber('il_progression_maximum_events', 'progressionMaximumEvents', 1, 200);
