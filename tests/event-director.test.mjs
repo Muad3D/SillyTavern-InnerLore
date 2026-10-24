@@ -156,3 +156,14 @@ test('a proposal keyed by the record word or naming ids with type prefixes is no
     assert.equal(definition.key, 'bell_rings');
     assert.equal(definition.actorName, 'hob garrow');
 });
+
+test('list-form consequences are joined instead of rejecting the proposal', () => {
+    const state = createProgressionState();
+    const result = validateEventDirectorPayload(payload({
+        consequences: [
+            'The miller investigates the jam.',
+            'Nearby workers can notice the warning bell.',
+        ],
+    }), validation(state));
+    assert.equal(result.proposal.consequences, 'The miller investigates the jam.\nNearby workers can notice the warning bell.');
+});
