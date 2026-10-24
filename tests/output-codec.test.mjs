@@ -461,17 +461,17 @@ test('parseInnerLoreOutput salvages truncated and DONE-less DSL documents', () =
         code: 'missing_done_salvaged', droppedLines: 0, totalLines: 3,
     }]);
 
-    // A cut that lands mid-token drops only the incomplete tail record; every
-    // record closed before the cut survives.
+    // A cut that lands mid-token drops only the possibly-cut last line (the
+    // open record keeps its complete lines); every record closed before the
+    // cut survives.
     const truncated = parseInnerLoreOutput(
         'INNERLORE CURATOR 1\nLOCATION Ben Tavern\nimportance = 70\nEND\nMIND Freesia\nactive = TRUE\ncurrent_mind.interpretation The inspect',
         { format: 'dsl', task: 'curator', salvageTruncated: true },
     );
     assert.equal(truncated.entities.length, 1);
-    assert.equal(truncated.minds.length, 0);
-    assert.deepEqual(outputParseDiagnostics(truncated), [{
-        code: 'truncated_tail_dropped', droppedLines: 3, totalLines: 6,
-    }]);
+    assert.equal(truncated.minds.length, 1);
+    assert.equal(truncated.minds[0].current_mind, undefined);
+    assert.deepEqual(outputParseDiagnostics(truncated).map(item => item.code), ['implicit_end_before_done', 'open_record_closed']);
 
     // Nothing salvageable: the original error propagates so repair runs.
     assert.throws(

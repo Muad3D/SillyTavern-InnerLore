@@ -4941,6 +4941,7 @@ function codecStatsFromResponse(response) {
         repaired: Boolean(response.repaired),
         salvaged: diagnostics.some(item => (
             item.code === 'truncated_tail_dropped' || item.code === 'missing_done_salvaged'
+            || item.code === 'open_record_closed'
         )),
         crossFormat: diagnostics.some(item => item.code === 'cross_format_json_accepted'),
         normalizations,

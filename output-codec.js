@@ -21,6 +21,13 @@ const MAXIMUM_LINES = 20_000;
 const MAXIMUM_RECORDS = 1_000;
 const MAXIMUM_ARRAY_INDEX = 1_000;
 const MAXIMUM_PATH_DEPTH = 16;
+// A looping model repeats list items until the token budget or a
+// repetition penalty stops it. Exact repeats are dropped, and one record's
+// list keeps at most this many new items per pass; the first items are the
+// model's own priority order and, in observed loops, the good ones.
+const LIST_APPEND_CAPS = Object.freeze({ curator: 20 });
+const DEFAULT_LIST_APPEND_CAP = 40;
+const DSL_FIELD_LINE = /^[a-z][a-z0-9_.\[\]]*\s*(?:\+=|=)\s*.+$/u;
 const DSL_PARSE_DIAGNOSTICS = Symbol('innerloreDslParseDiagnostics');
 const ROOT_ITEM_PATHS = Object.freeze({
     curator: new Set(['spatial.set', 'persistent_self.set', 'voice.set', 'relationships', 'current_mind.emotions']),
@@ -186,7 +193,14 @@ function descendForWrite(root, tokens, lineNumber) {
     return { parent, finalToken: tokens.at(-1) };
 }
 
-function writeScalar(root, rawPath, operator, value, lineNumber) {
+function listItemKey(value) {
+    if (value === null) return 'null';
+    if (typeof value === 'string') return `s:${value.trim().replace(/\s+/gu, ' ').toLocaleLowerCase()}`;
+    if (typeof value === 'number' || typeof value === 'boolean') return `${typeof value}:${value}`;
+    return null;
+}
+
+function writeScalar(root, rawPath, operator, value, lineNumber, appendCap = Number.POSITIVE_INFINITY) {
     const tokens = pathTokens(rawPath, lineNumber);
     const { parent, finalToken } = descendForWrite(root, tokens, lineNumber);
     if (operator === '+=') {
@@ -197,7 +211,13 @@ function writeScalar(root, rawPath, operator, value, lineNumber) {
         if (!Array.isArray(parent[finalToken])) {
             throw dslError(lineNumber, `field "${rawPath}" is not a list and cannot use +=.`);
         }
-        parent[finalToken].push(value);
+        const list = parent[finalToken];
+        const key = listItemKey(value);
+        if (key !== null && list.some(existing => listItemKey(existing) === key)) {
+            return { appendDuplicateDropped: true };
+        }
+        if (list.length >= appendCap) return { appendCapped: true };
+        list.push(value);
         return { duplicateIgnored: false };
     }
     if (typeof finalToken === 'number') {
@@ -410,6 +430,8 @@ export function parseInnerLoreDsl(value, requestedTask) {
     let records = 0;
     let done = false;
     let lastAppend = null;
+    const appendCap = LIST_APPEND_CAPS[task] ?? DEFAULT_LIST_APPEND_CAP;
+    const droppedAppends = new Map();
     let finalDoneIndex = -1;
     for (let index = allLines.length - 1; index > headerIndex; index--) {
         if (allLines[index].trim() === 'DONE') {
@@ -654,8 +676,15 @@ export function parseInnerLoreDsl(value, requestedTask) {
                     code: 'scalar_list_assignment_normalized', lineNumber, path: assignment[1],
                 });
             }
-            const writeResult = writeScalar(target, assignment[1], operator, scalarValue, lineNumber);
-            if (writeResult.duplicateIgnored) {
+            const writeResult = writeScalar(target, assignment[1], operator, scalarValue, lineNumber, appendCap);
+            if (writeResult.appendDuplicateDropped || writeResult.appendCapped) {
+                const code = writeResult.appendCapped ? 'list_append_cap_dropped' : 'duplicate_list_item_dropped';
+                const counterKey = `${code}\u0000${assignment[1]}`;
+                const counter = droppedAppends.get(counterKey)
+                    || { code, path: assignment[1], firstLineNumber: lineNumber, count: 0 };
+                counter.count++;
+                droppedAppends.set(counterKey, counter);
+            } else if (writeResult.duplicateIgnored) {
                 diagnostics.push({
                     code: 'duplicate_scalar_ignored', lineNumber, path: assignment[1],
                 });
@@ -694,6 +723,9 @@ export function parseInnerLoreDsl(value, requestedTask) {
         if (records > MAXIMUM_RECORDS) throw dslError(lineNumber, `document exceeds ${MAXIMUM_RECORDS} records.`);
     }
     if (!done) throw new Error('The model response ended before the InnerLore DSL DONE marker.');
+    for (const counter of droppedAppends.values()) {
+        diagnostics.push(counter.code === 'list_append_cap_dropped' ? { ...counter, cap: appendCap } : counter);
+    }
     if (task === 'progression') {
         if (!result.__timeSeen) throw new Error('InnerLore DSL progression output is missing its TIME record.');
         delete result.__timeSeen;
@@ -743,6 +775,59 @@ export function outputParseDiagnostics(payload) {
 const DSL_HEADER_PATTERN = new RegExp(`^INNERLORE\\s+(${TASK_HEADER_WORDS})\\s+1$`, 'iu');
 
 /**
+ * Close a record the response stopped inside. A model that loops
+ * on a list until a repetition penalty or the token budget ends it never
+ * writes END, and dropping the whole open record throws away its good lines.
+ * Every line before the last ended with a newline, so it is complete; the last
+ * line may be cut mid-value and is dropped unless the text ended after it.
+ * An ITEM block left open is cut away whole (its identity field may be the
+ * missing part). The open record's own header must be followed by at least
+ * one kept field line, so a header cut mid-name ("LOCATION House beside") is
+ * never stored: that case has no kept field after it and falls through to the
+ * existing tail-drop salvage.
+ */
+function openRecordSalvageLines(allLines, headerIndex, endsWithNewline) {
+    let last = allLines.length - 1;
+    while (last > headerIndex && !allLines[last].trim()) last--;
+    if (last <= headerIndex) return null;
+    const lastTrimmed = allLines[last].trim();
+    if (lastTrimmed === 'END' || lastTrimmed === 'DONE') return null;
+    let keepThrough = endsWithNewline ? last : last - 1;
+    while (keepThrough > headerIndex && !allLines[keepThrough].trim()) keepThrough--;
+    let depth = 0;
+    let cutAt = keepThrough + 1;
+    let recordHeader = -1;
+    for (let index = keepThrough; index > headerIndex; index--) {
+        const line = allLines[index].trim();
+        if (!line) continue;
+        if (line === 'END') {
+            depth++;
+            continue;
+        }
+        if (/^ITEM\s+\S/u.test(line)) {
+            if (depth > 0) depth--;
+            else cutAt = index;
+            continue;
+        }
+        if (DSL_FIELD_LINE.test(line) || /^\+=\s+\S/u.test(line)) continue;
+        // The first other line walking back is a record declaration. A
+        // pending END here means the tail followed a closed record instead.
+        if (depth > 0) return null;
+        recordHeader = index;
+        break;
+    }
+    if (recordHeader < 0) return null;
+    let keptField = false;
+    for (let index = recordHeader + 1; index < cutAt; index++) {
+        if (DSL_FIELD_LINE.test(allLines[index].trim())) {
+            keptField = true;
+            break;
+        }
+    }
+    return keptField ? allLines.slice(0, cutAt) : null;
+}
+
+/**
  * Recover the complete-record prefix of a DSL document that failed strict
  * parsing. A truncated line format is not malformed: every record closed
  * before the cut is complete, and merge-based consumers can apply that
@@ -760,6 +845,8 @@ function salvageTruncatedDsl(value, requestedTask, originalError) {
     const candidates = lastLine === 'END'
         ? [{ lines: allLines, code: 'missing_done_salvaged' }]
         : [];
+    const openRecordLines = openRecordSalvageLines(allLines, headerIndex, stripReasoningAndFences(value).endsWith('\n'));
+    if (openRecordLines) candidates.push({ lines: openRecordLines, code: 'open_record_closed' });
     let cut = -1;
     for (let index = allLines.length - 1; index > headerIndex; index--) {
         if (allLines[index].trim() === 'END') {
