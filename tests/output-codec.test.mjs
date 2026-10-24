@@ -677,6 +677,7 @@ test('DSL drops fields written with no value instead of failing the pass', () =>
         outputParseDiagnostics(parsed).filter(item => item.code === 'empty_assignment_dropped').map(item => item.path),
         ['summary', 'facts'],
     );
+});
 
 test('progression DSL accepts plural record words copied from the JSON field names', () => {
     const parsed = parseInnerLoreDsl([
