@@ -658,3 +658,27 @@ test('the DSL evaluation contract shows the matched-condition shape only when ke
     const without = appendDslEvaluationKeyContract([{ role: 'system', content: 'rules' }], 'dsl', []);
     assert.doesNotMatch(without[0].content, /trigger_action\.evidence/u);
 });
+
+test('progression DSL accepts plural record words copied from the JSON field names', () => {
+    const parsed = parseInnerLoreDsl([
+        'INNERLORE PROGRESSION 1',
+        'TIME',
+        'elapsed.estimated_seconds = 60',
+        'confidence = 1',
+        'END',
+        'GOALS courier_delivery',
+        'owner = Mara',
+        'title = Deliver the letter',
+        'status = active',
+        'END',
+        'PROCESSES mill_repair',
+        'subject_type = location',
+        'subject_name = Old Mill',
+        'title = Mill repair',
+        'status = active',
+        'END',
+        'DONE',
+    ].join('\n'), 'progression');
+    assert.deepEqual(parsed.goals.map(goal => goal.key), ['courier_delivery']);
+    assert.deepEqual(parsed.processes.map(process => process.key), ['mill_repair']);
+});

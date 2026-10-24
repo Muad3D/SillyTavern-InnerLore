@@ -291,9 +291,13 @@ function openRecord(task, line, result, lineNumber) {
         return record;
     }
     if (task === 'progression') {
-        const match = /^(TIME|GOAL|PROCESS|EVENT|EVALUATION)(?:\s+(.+))?$/iu.exec(line);
+        // Models copy the plural JSON field names (goals, processes, events,
+        // evaluations) that the shared progression prompt uses throughout,
+        // so the plural record words are accepted as the singular ones.
+        const match = /^(TIME|GOALS?|PROCESS(?:ES)?|EVENTS?|EVALUATIONS?)(?:\s+(.+))?$/iu.exec(line);
         if (!match) return null;
-        const kind = match[1].toLocaleLowerCase();
+        const rawKind = match[1].toLocaleLowerCase();
+        const kind = ({ goals: 'goal', processes: 'process', events: 'event', evaluations: 'evaluation' })[rawKind] || rawKind;
         const key = decodedHeaderValue(match[2] || '', lineNumber);
         if (kind === 'time') {
             if (result.__timeSeen) throw dslError(lineNumber, 'TIME may appear only once.');
@@ -355,7 +359,7 @@ function isTopLevelDeclaration(task, line) {
         return /^(?:LOCATION|ITEM|CHARACTER|FACTION|ORGANIZATION|CREATURE|EVENT|CONCEPT|ENTITY|MIND)(?:\s+.+)?$/iu.test(line);
     }
     if (task === 'progression') {
-        return /^(?:TIME|GOAL|PROCESS|EVENT|EVALUATION)(?:\s+.+)?$/iu.test(line);
+        return /^(?:TIME|GOALS?|PROCESS(?:ES)?|EVENTS?|EVALUATIONS?)(?:\s+.+)?$/iu.test(line);
     }
     if (task === 'game' || task === 'planner') {
         return new RegExp(`^(?:CURRENCY|PURSE|${Object.keys(GAME_RECORDS[task]).join('|')})(?:\\s+(?!\\+?=).+)?$`, 'iu').test(line);
