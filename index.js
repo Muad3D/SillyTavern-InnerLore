@@ -8083,6 +8083,99 @@ function initializeServerStateAfterAppReady(ctx) {
     }
 }
 
+// ---- Docked panel ------------------------------------------------------------
+// InnerLore's settings live in their own top-bar drawer that opens beside the
+// chat, like Character Management, instead of inside the Extensions panel.
+// Nothing here is new machinery; it copies what SillyTavern already does:
+//  - markup/classes of #rightNavHolder (public/index.html): .drawer >
+//    .drawer-toggle > .drawer-icon, and .drawer-content.fillRight with a pin
+//    checkbox and a .scrollableInner (the .fillLeft/.fillRight CSS in
+//    public/style.css is what places it in the side gutter, so the chat is
+//    never covered or resized);
+//  - open/close: doNavbarIconClick, exported by public/script.js (ST binds it
+//    only to toggles that exist at startup, so a drawer added by an extension
+//    has to bind it itself);
+//  - pin: the #rm_button_panel_pin pattern in public/scripts/RossAscends-mods.js
+//    (pinnedOpen on the panel, drawerPinnedOpen on the icon, state kept in
+//    accountStorage, re-opened on load when it was locked and open).
+// Change `side` to 'fillLeft' to dock it on the AI Response Configuration side.
+// Returns false, leaving the caller to fall back to the Extensions panel, when
+// the top bar or SillyTavern's handler is not there (or under the Node tests).
+const DOCKED_PANEL = Object.freeze({ side: 'fillRight', lockKey: 'ILNavLockOn', openKey: 'ILNavOpened' });
+
+async function mountDockedPanel(ctx, html) {
+    try {
+        const holder = document.getElementById('top-settings-holder');
+        if (!holder || !html) return false;
+        const { doNavbarIconClick } = await import('../../../../script.js');
+        if (typeof doNavbarIconClick !== 'function') return false;
+
+        const store = ctx?.accountStorage && typeof ctx.accountStorage.getItem === 'function'
+            ? ctx.accountStorage
+            : { getItem: key => globalThis.localStorage?.getItem(key), setItem: (key, value) => globalThis.localStorage?.setItem(key, value) };
+
+        const drawer = document.createElement('div');
+        drawer.id = 'il_panel_button';
+        drawer.className = 'drawer';
+        drawer.innerHTML = `
+            <div class="drawer-toggle drawer-header">
+                <div id="il_panel_icon" class="drawer-icon fa-solid fa-brain fa-fw closedIcon" title="InnerLore"></div>
+            </div>
+            <div id="il_panel" class="drawer-content ${DOCKED_PANEL.side} closedDrawer">
+                <div id="il_panel_pin_div" title="Locked = InnerLore panel will stay open">
+                    <input type="checkbox" id="il_panel_pin">
+                    <label for="il_panel_pin">
+                        <div class="unchecked fa-solid fa-unlock right_menu_button"></div>
+                        <div class="checked fa-solid fa-lock right_menu_button"></div>
+                    </label>
+                </div>
+                <div class="scrollableInner"></div>
+            </div>`;
+        drawer.querySelector('.scrollableInner').innerHTML = html;
+
+        const rightNav = document.getElementById('rightNavHolder');
+        (rightNav?.parentNode ?? holder).insertBefore(drawer, rightNav ?? null);
+
+        const toggle = drawer.querySelector('.drawer-toggle');
+        const icon = drawer.querySelector('#il_panel_icon');
+        const panel = drawer.querySelector('#il_panel');
+        const pin = drawer.querySelector('#il_panel_pin');
+
+        $(toggle).on('click', doNavbarIconClick);
+
+        // Remember open/closed, read before the toggle flips it (as ST does for its own panels).
+        icon.addEventListener('click', () => {
+            store.setItem(DOCKED_PANEL.openKey, String(!icon.classList.contains('openIcon')));
+        });
+
+        pin.addEventListener('click', () => {
+            store.setItem(DOCKED_PANEL.lockKey, String(pin.checked));
+            if (pin.checked) {
+                panel.classList.add('pinnedOpen');
+                icon.classList.add('drawerPinnedOpen');
+            } else {
+                panel.classList.remove('pinnedOpen');
+                icon.classList.remove('drawerPinnedOpen');
+                if (panel.classList.contains('openDrawer') && document.querySelectorAll('.openDrawer').length > 1) {
+                    doNavbarIconClick.call(toggle);
+                }
+            }
+        });
+
+        if (store.getItem(DOCKED_PANEL.lockKey) === 'true') {
+            pin.checked = true;
+            panel.classList.add('pinnedOpen');
+            icon.classList.add('drawerPinnedOpen');
+            if (store.getItem(DOCKED_PANEL.openKey) === 'true') setTimeout(() => icon.click(), 600);
+        }
+        return true;
+    } catch (error) {
+        console.debug(LOG_PREFIX, 'Docked panel unavailable; using the Extensions panel.', error);
+        document.getElementById?.('il_panel_button')?.remove();
+        return false;
+    }
+}
+
 // Dual-mode entry: this file is the browser extension AND, when SillyTavern's
 // plugin loader imports it from plugins/, the server plugin. Browser startup
 // must not run under Node, and Node must not touch browser globals. The
@@ -8098,7 +8191,8 @@ if (RUNNING_IN_BROWSER) (async function init() {
         getSettings();
         registerContextMacros();
         const html = await ctx.renderExtensionTemplateAsync('third-party/SillyTavern-InnerLore', 'settings', {});
-        $('#extensions_settings2').append(html);
+        // Own top-bar drawer beside the chat; the Extensions panel is only the fallback.
+        if (!(await mountDockedPanel(ctx, html))) $('#extensions_settings2').append(html);
         populateProfiles();
         applySettingsToUI();
         bindUIEvents();
