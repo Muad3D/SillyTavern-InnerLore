@@ -20,6 +20,7 @@ import {
     ensurePlayerEntity,
     pruneCheckpointLadder,
     mergeEntityOperations,
+    stampEntityTimes,
     mergeMindOperations,
     messageFingerprint,
     playerEntityKeys,
@@ -4756,6 +4757,14 @@ async function analyzeRange(targetStore, startIndex, endIndex, options = {}) {
             if (fingerprint) targetStore.progression.processedFingerprints[index] = fingerprint;
         }
         targetStore.progression.lastProcessedIndex = endIndex;
+    }
+
+    // Record WHEN (on the story clock) the lore touched by this pass was
+    // written down. The clock was just advanced by this batch, so the stamp is
+    // the story time at the end of the passage the curator read.
+    if (settings.worldProgressionEnabled && settings.autoLoreEnabled
+        && targetStore.progression?.clock && entityResult.changedIds?.length) {
+        stampEntityTimes(targetStore, entityResult.changedIds, targetStore.progression.clock.estimatedSeconds);
     }
 
     const gameCommit = commitGamePasses(targetStore, {

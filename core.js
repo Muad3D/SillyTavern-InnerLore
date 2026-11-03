@@ -354,6 +354,61 @@ export function compactEntityFacts(record, values = record?.facts) {
     return facts.filter(value => !CHARACTER_DIALOGUE_LEDGER.test(value));
 }
 
+/**
+ * Compact story-time label for a clock reading in seconds ("story +40m").
+ * Empty when the reading is unknown.
+ */
+export function storyOffsetLabel(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value < 0) return '';
+    if (value < 60) return 'story start';
+    const minutes = Math.floor(value / 60);
+    if (minutes < 60) return `story +${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `story +${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ''}`;
+    const days = Math.floor(hours / 24);
+    return `story +${days}d${hours % 24 ? ` ${hours % 24}h` : ''}`;
+}
+
+/** A fact or history line with the story time it was recorded at, when known. */
+export function withStoryTime(record, text) {
+    const key = canonicalNameKey(text);
+    const label = storyOffsetLabel(record?.factTimes?.[key]);
+    return label ? `${text} [${label}]` : text;
+}
+
+/**
+ * Remember WHEN (on the story clock) each fact and history line was first
+ * recorded. The text stays untouched, so de-duplication and remove_* matching
+ * keep working; the time lives in a side map keyed like the text.
+ */
+export function stampEntityTimes(store, ids, seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value < 0 || !store?.entities) return 0;
+    let stamped = 0;
+    for (const id of new Set(ids || [])) {
+        const record = store.entities[id];
+        if (!record || typeof record !== 'object') continue;
+        const times = record.factTimes && typeof record.factTimes === 'object' ? record.factTimes : {};
+        const live = new Set();
+        for (const text of [...compactEntityFacts(record), ...uniqueStrings(record.history, ENTITY_ARRAY_LIMITS.history)]) {
+            const key = canonicalNameKey(text);
+            if (!key) continue;
+            live.add(key);
+            if (!Number.isFinite(times[key])) {
+                times[key] = Math.round(value);
+                stamped++;
+            }
+        }
+        for (const key of Object.keys(times)) if (!live.has(key)) delete times[key];
+        record.factTimes = times;
+        if (!Number.isFinite(record.firstSeenStorySeconds) && live.size) {
+            record.firstSeenStorySeconds = Math.round(value);
+        }
+    }
+    return stamped;
+}
+
 function unresolvedSemanticKey(value, record) {
     let key = canonicalNameKey(value);
     const references = uniqueStrings([record?.name, ...(record?.aliases || [])])
@@ -1630,6 +1685,13 @@ function mergeCanonicalEntityPair(primary, duplicate) {
     primary.facts = mergeStrings(primary.facts || [], duplicate.facts || [], [], ENTITY_ARRAY_LIMITS.facts);
     primary.relationships = mergeStrings(primary.relationships || [], duplicate.relationships || [], [], ENTITY_ARRAY_LIMITS.relationships);
     primary.history = mergeStrings(primary.history || [], duplicate.history || [], [], ENTITY_ARRAY_LIMITS.history);
+    // Keep the earliest story time recorded for any line the two records share.
+    primary.factTimes = { ...(duplicate.factTimes || {}), ...(primary.factTimes || {}) };
+    for (const [key, seconds] of Object.entries(duplicate.factTimes || {})) {
+        if (Number.isFinite(seconds) && Number.isFinite(primary.factTimes[key])) {
+            primary.factTimes[key] = Math.min(primary.factTimes[key], seconds);
+        }
+    }
     primary.unresolved = mergeUnresolved(primary.unresolved || [], duplicate.unresolved || [], [], primary, ENTITY_ARRAY_LIMITS.unresolved);
     if (normalizeEntityType(primary.type) === 'location') {
         primary.spatial = normalizeEntitySpatial({
@@ -3153,7 +3215,7 @@ export function renderLoreContent(record) {
     const blocks = [`[InnerLore ${type}: ${title}]`];
     if (cleanString(record?.summary)) blocks.push(`Overview: ${cleanString(record.summary)}`);
     if (cleanString(record?.description)) blocks.push(`Description: ${cleanString(record.description)}`);
-    const facts = section('Established facts', compactEntityFacts(record));
+    const facts = section('Established facts', compactEntityFacts(record).map(fact => withStoryTime(record, fact)));
     const spatial = section(
         'Spatial invariants',
         Object.values(record?.spatial?.invariants || {}).map(invariant => (
@@ -3161,7 +3223,7 @@ export function renderLoreContent(record) {
         )),
     );
     const relationships = section('Relationships and associations', record?.relationships);
-    const history = section('Relevant history', record?.history);
+    const history = section('Relevant history', uniqueStrings(record?.history, 100).map(item => withStoryTime(record, item)));
     if (facts) blocks.push(facts);
     if (spatial) blocks.push(spatial);
     if (relationships) blocks.push(relationships);
@@ -3250,7 +3312,8 @@ export function renderCompactEntity(record, maximumLength = 1_800, options = {})
         },
     );
 
-    append('', `${record.name} (${record.type})`, { always: true });
+    const firstRecorded = options.storyTimeStamps === false ? '' : storyOffsetLabel(record.firstSeenStorySeconds);
+    append('', `${record.name} (${record.type})${firstRecorded ? ` — first recorded ${firstRecorded}` : ''}`, { always: true });
     // Always-on and unregistered: a short place name in the claim registry
     // would make every longer state line that mentions it look duplicated.
     if (record.currentLocationName) append('Location', record.currentLocationName, { always: true });
@@ -3278,7 +3341,9 @@ export function renderCompactEntity(record, maximumLength = 1_800, options = {})
     for (const relationship of rankedContextValues(record.relationships, focusText, 3)) {
         append('Association', relationship);
     }
-    for (const fact of rankedContextValues(compactEntityFacts(record), focusText, 5)) append('Canon', fact);
+    for (const fact of rankedContextValues(compactEntityFacts(record), focusText, 5)) {
+        append('Canon', options.storyTimeStamps === false ? fact : withStoryTime(record, fact));
+    }
     if (record.status && record.status !== 'active') append('Status', `${record.status}.`);
 
     const text = cleanString(lines.join('\n'), maximum);

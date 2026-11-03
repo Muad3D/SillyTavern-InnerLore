@@ -9,7 +9,7 @@ import { cleanString, compilePromptInjection } from './core.js?v=48';
 import { contextProfileOverrides } from './context-config.js';
 import { collectRecentStoryExpressions } from './expression-cooldown.js';
 import { renderGamePacket } from './game.js?v=2';
-import { compileProgressionInjection } from './progression.js';
+import { compileProgressionInjection, formatClockRange } from './progression.js';
 import { deriveCameraFrame, deriveSceneState, renderCameraPacket } from './scene.js?v=7';
 
 function reasonText(reasons) {
@@ -64,6 +64,23 @@ export function formatContextDiagnostics(compilation) {
     return lines.join('\n');
 }
 
+/**
+ * The story clock as its own small block. It used to live only inside the
+ * World Progression block, which the compiler drops first when the packet is
+ * over budget - exactly when the narrator most needs a reminder of how little
+ * story time has passed. This block is never dropped.
+ */
+export function renderStoryClockBlock(progression, settings = {}) {
+    if (settings.storyClockBlockEnabled === false) return '';
+    const clock = progression?.clock;
+    if (!clock || !(Number(clock.estimatedSeconds) > 0)) return '';
+    const label = clock.currentTimeLabel ? `; current label: ${cleanString(clock.currentTimeLabel, 120)}` : '';
+    return `<inner_lore_story_clock narrator_only="true">
+Story time elapsed since the story began: ${formatClockRange(clock)}${label}.
+Anything that began inside this story - a power, skill, habit, friendship, grudge, routine - is at most that old. Do not describe practice, experience or history longer than this allows unless the character card or an entry's recorded story time says it started earlier. Entries tagged [story +…] show when the story clock read that value as the fact was recorded.
+</inner_lore_story_clock>`;
+}
+
 export function compileContext(options = {}) {
     const settings = options.settings || {};
     if (!settings.enabled || !options.store) {
@@ -71,7 +88,7 @@ export function compileContext(options = {}) {
             text: '',
             scene: null,
             camera: null,
-            blocks: { scene: '', game: '', minds: '', lore: '', progression: '' },
+            blocks: { clock: '', scene: '', game: '', minds: '', lore: '', progression: '' },
             selectedBrains: [],
             selectedEntities: [],
             selectedProgression: [],
@@ -116,7 +133,8 @@ export function compileContext(options = {}) {
     let continuity = null;
     let progression = null;
     let sceneText = '';
-    let blocks = { scene: '', game: '', minds: '', lore: '', progression: '' };
+    const clockBlock = renderStoryClockBlock(options.store.progression, settings);
+    let blocks = { clock: clockBlock, scene: '', game: '', minds: '', lore: '', progression: '' };
     let text = '';
     for (let attempt = 0; ; attempt++) {
         progression = compileProgressionInjection(options.store.progression, options.recentText, {
@@ -146,6 +164,7 @@ export function compileContext(options = {}) {
                 maximumCharacters: attemptSettings.gameInjectionBudget ?? 3_000,
             });
         blocks = {
+            clock: clockBlock,
             scene: sceneText,
             game: gameText,
             minds: continuity.blocks.minds,
